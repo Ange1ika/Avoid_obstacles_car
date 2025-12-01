@@ -15,7 +15,7 @@ from collections import Counter
 # =====================================================
 RECORD_OVERLAY_VIDEO   = False   
 RECORD_RAW_VIDEO       = False    
-SAVE_PREDICT_FRAMES    = True    
+SAVE_PREDICT_FRAMES    = False    
 # =====================================================
 LOW_BLUE  = np.array([100, 150, 50])
 HIGH_BLUE = np.array([140, 255, 255])
