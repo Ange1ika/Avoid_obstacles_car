@@ -1,16 +1,1 @@
 timestamp,action,left_speed,right_speed
-20:24:12,set_speed,0,0
-20:24:12,stop,0,0
-20:24:14,set_speed,60,-60
-20:24:14,turn_right,60,-60
-20:24:15,set_speed,0,0
-20:24:15,stop,0,0
-20:24:15,set_speed,50,50
-20:24:15,forward,50,50
-20:24:15,set_speed,50,50
-20:24:15,forward,50,50
-20:24:15,set_speed,0,0
-20:24:15,stop,0,0
-20:24:15,set_speed,0,0
-20:24:15,stop,0,0
-20:24:15,cleanup,0,0

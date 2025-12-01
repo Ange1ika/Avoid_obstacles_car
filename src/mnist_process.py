@@ -4,7 +4,7 @@ import tensorflow as tf
 import os
 
 # ===================== ПУТЬ К YOLO TFLITE =====================
-MODEL_PATH = "/home/raspberry/Desktop/avoid_obstacles_car/ckp/best_float32.tflite"
+MODEL_PATH = "/home/raspberry/Desktop/avoid_obstacles_car/ckp/best_float16_2dec.tflite"
 
 IMG_SIZE = 320
 NUM_CLASSES = 9          # как у тебя: 14 - 5

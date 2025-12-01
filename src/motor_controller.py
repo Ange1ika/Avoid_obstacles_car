@@ -93,15 +93,15 @@ class MotorController:
         self.set_speed(0, 0)
         self._log("stop", 0, 0)
 
-    def turn_in_place(self, direction, speed, duration):
+    def turn_in_place(self, direction, speed, duration=0.0):
         """direction: -1 (влево), +1 (вправо)"""
         if direction < 0:
             self.set_speed(-speed, speed)
         else:
             self.set_speed(speed, -speed)
-        self._log(f"turn_{'left' if direction<0 else 'right'}", 
-                  -speed if direction<0 else speed,
-                  speed if direction<0 else -speed)
+        # self._log(f"turn_{'left' if direction<0 else 'right'}", 
+        #           -speed if direction<0 else speed,
+        #           speed if direction<0 else -speed)
         time.sleep(duration)
         self.stop()
 

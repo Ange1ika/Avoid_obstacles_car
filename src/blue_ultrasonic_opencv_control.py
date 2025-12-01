@@ -79,9 +79,9 @@ SCAN_MAX = 180
 STEP = 5
 
 # сектора по углам
-LEFT_RANGE   = range(150, 170, STEP)   # 140–170
-CENTER_RANGE = range(80, 100, STEP)   # 80–100
-RIGHT_RANGE  = range(10,  30,  STEP)   # 10–40
+LEFT_RANGE   = range(120, 180, STEP)
+CENTER_RANGE = range(60, 120, STEP)
+RIGHT_RANGE  = range(0,  60,  STEP)
 
 def scan_full_semicircle():
     """Скан всей полусферы: 0..180°."""
@@ -98,6 +98,8 @@ def scan_full_semicircle():
 
     return distances
 
+TURN_LEFT_TIME  = 0.75
+TURN_RIGHT_TIME = 0.75
 
 def choose_best_direction(motor, speed=50):
 
@@ -108,6 +110,10 @@ def choose_best_direction(motor, speed=50):
         if not vals:
             return 0
         return sum(vals) / len(vals)
+
+    LEFT_RANGE   = range(120, 180, STEP)
+    CENTER_RANGE = range(60, 120, STEP)
+    RIGHT_RANGE  = range(0,  60,  STEP)
 
     left_avg   = avg_sector(LEFT_RANGE)
     center_avg = avg_sector(CENTER_RANGE)
@@ -120,20 +126,22 @@ def choose_best_direction(motor, speed=50):
         "CENTER": center_avg,
         "RIGHT": right_avg
     }
+
     best_sector = max(sector_values, key=sector_values.get)
     print("BEST SECTOR:", best_sector)
 
     if best_sector == "CENTER":
-        motor.move_forward(speed*1.5, 0.7)
-        #time.sleep(0.7)
+        motor.move_forward(speed*1.4, 0.7)
 
     elif best_sector == "LEFT":
-        motor.turn_in_place(-1, speed, 0.45)
+        motor.turn_in_place(-1, speed, TURN_LEFT_TIME)
 
     elif best_sector == "RIGHT":
-        motor.turn_in_place(1, speed, 0.45)
+        motor.turn_in_place(1, speed, TURN_RIGHT_TIME)
 
+    #time.sleep(0.1)
     motor.stop()
+
 
 
 # ===================== DIGIT RECOGNITION + SAVE MASK =====================
@@ -141,7 +149,7 @@ def recognize_digit_3_frames(camera, save_frames_dir=None, save_masks_dir=None):
     results = []
     all_preds = []
 
-    for i in range(3):
+    for i in range(2):
         frame = camera.capture_array()
         frame = cv2.flip(frame, -1)
 
@@ -156,7 +164,7 @@ def recognize_digit_3_frames(camera, save_frames_dir=None, save_masks_dir=None):
         if conf > 0.3:
             results.append(digit)
 
-        time.sleep(0.1)
+        #time.sleep(0.1)
 
     if not results:
         return None, all_preds
@@ -164,10 +172,6 @@ def recognize_digit_3_frames(camera, save_frames_dir=None, save_masks_dir=None):
     final_digit = Counter(results).most_common(1)[0][0]
     return final_digit, all_preds
 
-
-# =====================================================
-# ===================== MAIN ===========================
-# =====================================================
 def main():
 
     motor = MotorController()
@@ -200,9 +204,9 @@ def main():
             fourcc, 20.0, (width, height)
         )
 
-    OBSTACLE_LIMIT = 60
-    CLOSE_OBJECT_AREA = 35000
-    SPEED = 50
+    OBSTACLE_LIMIT = 70
+    CLOSE_OBJECT_AREA = 40000
+    SPEED = 65
 
     servo.value = angle_to_servo_value(90)
 
@@ -248,9 +252,9 @@ def main():
                         
                         if digit is not None:
                             if digit % 2 == 0:
-                                motor.turn_in_place(1, 67, 0.7)
+                                motor.turn_in_place(1, 75, 0.9)
                             else:
-                                motor.turn_in_place(-1, 67, 0.7)
+                                motor.turn_in_place(-1, 75, 0.9)
                         else:
                             choose_best_direction(motor)
 
@@ -261,7 +265,7 @@ def main():
                     elif cx > width * 0.6:
                         motor.set_speed(SPEED, -SPEED)
                     else:
-                        motor.move_forward(SPEED*1.5)
+                        motor.move_forward(SPEED*2)
 
                     continue
 
