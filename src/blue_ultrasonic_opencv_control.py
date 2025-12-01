@@ -1,5 +1,4 @@
 import time
-import csv
 import cv2
 import numpy as np
 from picamera2 import Picamera2
@@ -7,22 +6,27 @@ from gpiozero import Servo
 from gpiozero.pins.lgpio import LGPIOFactory
 from motor_controller import MotorController
 from mnist_process import *
-
 import tensorflow as tf
 import os
 from collections import Counter
 
+# =====================================================
+# ===================== FLAGS =========================
+# =====================================================
+RECORD_OVERLAY_VIDEO   = False   
+RECORD_RAW_VIDEO       = False    
+SAVE_PREDICT_FRAMES    = True    
+# =====================================================
+LOW_BLUE  = np.array([100, 150, 50])
+HIGH_BLUE = np.array([140, 255, 255])
 
 # ===================== GPIO CHECK =====================
 try:
     import RPi.GPIO as GPIO
     GPIO_AVAILABLE = True
+    GPIO.setwarnings(False)
 except Exception:
     GPIO_AVAILABLE = False
-    
-
-LOW_BLUE  = np.array([100, 150, 50])
-HIGH_BLUE = np.array([140, 255, 255])
 
 # ===================== SERVO =====================
 factory = LGPIOFactory()
@@ -36,7 +40,6 @@ servo = Servo(
 def angle_to_servo_value(angle):
     return (angle - 90) / 90.0
 
-
 # ===================== ULTRASONIC =====================
 TRIG = 5
 ECHO = 6
@@ -44,36 +47,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(TRIG, GPIO.OUT)
 GPIO.setup(ECHO, GPIO.IN)
 
-
-def recognize_digit_3_frames(camera):
-    results = []
-
-    for i in range(3):
-        frame = camera.capture_array()
-        frame = cv2.flip(frame, -1)
-
-        tensor = preprocess_digit_inside_blue_roi(frame, f"live_{i}")
-        if tensor is None:
-            print("⚠️ Digit not extracted")
-            continue
-
-        digit, conf = infer_digit(tensor)
-        print(f"Frame {i}: digit={digit}, conf={conf:.2f}")
-
-        if conf > 0.5:
-            results.append(digit)
-
-        time.sleep(0.1)
-
-    if not results:
-        print("❌ No valid digit recognized")
-        return None
-
-    final_digit = Counter(results).most_common(1)[0][0]
-    print("✅ FINAL DIGIT:", final_digit)
-    return final_digit
-
-
+# ===================== SAFE DISTANCE =====================
 def measure_distance():
     GPIO.output(TRIG, False)
     time.sleep(0.0002)
@@ -85,165 +59,234 @@ def measure_distance():
     pulse_start = time.time()
     pulse_end = time.time()
 
+    timeout_start = time.time()
     while GPIO.input(ECHO) == 0:
         pulse_start = time.time()
+        if pulse_start - timeout_start > 0.03:
+            return 999
 
+    timeout_start = time.time()
     while GPIO.input(ECHO) == 1:
         pulse_end = time.time()
+        if pulse_end - timeout_start > 0.03:
+            return 999
 
     return round((pulse_end - pulse_start) * 17150, 2)
+# ----------------- FULL SEMICIRCLE SCAN -----------------
 
+SCAN_MIN = 0
+SCAN_MAX = 180
+STEP = 5
 
-# ===================== SERVO SCAN =====================
-def scan_with_servo():
-    scan_angles = [170, 90, 10]
+# сектора по углам
+LEFT_RANGE   = range(150, 170, STEP)   # 140–170
+CENTER_RANGE = range(80, 100, STEP)   # 80–100
+RIGHT_RANGE  = range(10,  30,  STEP)   # 10–40
+
+def scan_full_semicircle():
+    """Скан всей полусферы: 0..180°."""
     distances = {}
 
-    for ang in scan_angles:
+    for ang in range(SCAN_MIN, SCAN_MAX + 1, STEP):
         servo.value = angle_to_servo_value(ang)
-        time.sleep(0.15)
-        dist = measure_distance()
+        time.sleep(0.03)
+
+        dist = measure_distance()   # ОДНО измерение
         distances[ang] = dist
-        print(f"SCAN {ang}° → {dist} cm")
+
+        print(f"[SCAN] {ang:3d}° → {dist:6.1f} cm")
 
     return distances
 
 
-def choose_best_direction(motor):
-    distances = scan_with_servo()
-    best_angle = max(distances, key=distances.get)
+def choose_best_direction(motor, speed=50):
 
-    print("BEST ANGLE:", best_angle)
+    distances = scan_full_semicircle()
 
-    if best_angle == 90:
-        motor.move_forward(60)
-        time.sleep(0.7)
-    elif best_angle == 170:
-        motor.turn_in_place(-1, 50, 0.45)
-    elif best_angle == 10:
-        motor.turn_in_place(1, 50, 0.45)
+    def avg_sector(angle_range):
+        vals = [distances[a] for a in angle_range if distances[a] < 500]
+        if not vals:
+            return 0
+        return sum(vals) / len(vals)
+
+    left_avg   = avg_sector(LEFT_RANGE)
+    center_avg = avg_sector(CENTER_RANGE)
+    right_avg  = avg_sector(RIGHT_RANGE)
+
+    print(f"[SECTORS] LEFT={left_avg:.1f}  CENTER={center_avg:.1f}  RIGHT={right_avg:.1f}")
+
+    sector_values = {
+        "LEFT": left_avg,
+        "CENTER": center_avg,
+        "RIGHT": right_avg
+    }
+    best_sector = max(sector_values, key=sector_values.get)
+    print("BEST SECTOR:", best_sector)
+
+    if best_sector == "CENTER":
+        motor.move_forward(speed*1.5, 0.7)
+        #time.sleep(0.7)
+
+    elif best_sector == "LEFT":
+        motor.turn_in_place(-1, speed, 0.45)
+
+    elif best_sector == "RIGHT":
+        motor.turn_in_place(1, speed, 0.45)
 
     motor.stop()
-    
 
 
+# ===================== DIGIT RECOGNITION + SAVE MASK =====================
+def recognize_digit_3_frames(camera, save_frames_dir=None, save_masks_dir=None):
+    results = []
+    all_preds = []
+
+    for i in range(3):
+        frame = camera.capture_array()
+        frame = cv2.flip(frame, -1)
+
+        if SAVE_PREDICT_FRAMES and save_frames_dir is not None:
+            ts = int(time.time() * 1000)
+            raw_path = os.path.join(save_frames_dir, f"predict_{ts}_{i}.png")
+            cv2.imwrite(raw_path, frame)
+
+        digit, conf, dets = infer_digit_yolo(frame)
+        all_preds.append((digit, conf))
+
+        if conf > 0.3:
+            results.append(digit)
+
+        time.sleep(0.1)
+
+    if not results:
+        return None, all_preds
+
+    final_digit = Counter(results).most_common(1)[0][0]
+    return final_digit, all_preds
+
+
+# =====================================================
+# ===================== MAIN ===========================
+# =====================================================
 def main():
 
     motor = MotorController()
 
     width, height = 640, 480
     camera = Picamera2()
-    
-    # ===================== VIDEO RECORD =====================
-    VIDEO_DIR = "videos"
-    os.makedirs(VIDEO_DIR, exist_ok=True)
-
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    video_path = os.path.join(VIDEO_DIR, f"record_{int(time.time())}.avi")
-
-    video_writer = cv2.VideoWriter(
-        video_path,
-        fourcc,
-        20.0,              # FPS
-        (width, height)    # размер кадра
-    )
-
-
     camera.configure(camera.create_video_configuration(
         main={"format": 'XRGB8888', "size": (width, height)}
     ))
     camera.start()
 
+    # ===================== DIRS =====================
+    os.makedirs("videos", exist_ok=True)
+    os.makedirs("videos_raw", exist_ok=True)
+    os.makedirs("predict_frames", exist_ok=True)
+    os.makedirs("predict_masks", exist_ok=True)
+    os.makedirs("predict_overlay", exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+
+    if RECORD_OVERLAY_VIDEO:
+        overlay_writer = cv2.VideoWriter(
+            f"videos/overlay_{int(time.time())}.avi",
+            fourcc, 20.0, (width, height)
+        )
+
+    if RECORD_RAW_VIDEO:
+        raw_writer = cv2.VideoWriter(
+            f"videos_raw/raw_{int(time.time())}.avi",
+            fourcc, 20.0, (width, height)
+        )
+
     OBSTACLE_LIMIT = 60
-    CLOSE_OBJECT_AREA = 30000
+    CLOSE_OBJECT_AREA = 35000
     SPEED = 50
 
     servo.value = angle_to_servo_value(90)
 
-    while True:
-        frame = camera.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    print("✅ SYSTEM STARTED")
 
-        mask = cv2.inRange(
-            hsv,
-            LOW_BLUE,
-            HIGH_BLUE)
-        
-        # --- делаем цветную маску ---
-        mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    try:
+        while True:
+            frame = camera.capture_array()
+            frame = cv2.flip(frame, -1)  
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-        # --- накладываем маску на оригинал ---
-        overlay = cv2.addWeighted(frame, 0.7, mask_colored, 0.3, 0)
+            if RECORD_RAW_VIDEO:
+                raw_writer.write(frame)
 
-        # --- ПИШЕМ КАДР В ВИДЕО ---
-        video_writer.write(overlay)
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, LOW_BLUE, HIGH_BLUE)
 
+            mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            overlay = cv2.addWeighted(frame, 0.7, mask_colored, 0.3, 0)
 
+            if RECORD_OVERLAY_VIDEO:
+                overlay_writer.write(overlay)
 
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # ===== 1. ЕСЛИ КВАДРАТ НАЙДЕН → РУЛИМ ПО КАМЕРЕ =====
-        if contours:
-            max_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(max_contour)
+            if contours:
+                max_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(max_contour)
 
-            if area > 1000:
-                x, y, w, h = cv2.boundingRect(max_contour)
-                cx = int(x + w / 2)
+                if area > 1000:
+                    x, y, w, h = cv2.boundingRect(max_contour)
+                    cx = int(x + w / 2)
 
-                print("BLUE AREA:", area)
+                    if area > CLOSE_OBJECT_AREA:
+                        motor.stop()
 
-                # ✅✅✅ ВОТ ТУТ НОВАЯ ЛОГИКА ✅✅✅
-                if area > CLOSE_OBJECT_AREA:
-                    print("📸 TARGET REACHED → DIGIT RECOGNITION")
-
-                    motor.stop()
-                    time.sleep(0.001)
-                    digit = recognize_digit_3_frames(camera)
-
-                    if digit is not None:
-                        if digit % 2 == 0:
-                            print("↩ EVEN → TURN RIGHT")
-                            motor.turn_in_place(1, 60, 0.7)
+                        digit, preds = recognize_digit_3_frames(
+                            camera,
+                            "predict_frames",
+                            "predict_masks"
+                        )
+                        print(f"Preds : {preds}")
+                        
+                        if digit is not None:
+                            if digit % 2 == 0:
+                                motor.turn_in_place(1, 67, 0.7)
+                            else:
+                                motor.turn_in_place(-1, 67, 0.7)
                         else:
-                            print("↪ ODD → TURN LEFT")
-                            motor.turn_in_place(-1, 60, 0.7)
+                            choose_best_direction(motor)
+
+                        continue
+
+                    if cx < width * 0.4:
+                        motor.set_speed(-SPEED, SPEED)
+                    elif cx > width * 0.6:
+                        motor.set_speed(SPEED, -SPEED)
                     else:
-                        print("⚠️ DIGIT FAIL → SERVO SCAN")
-                        choose_best_direction(motor)
+                        motor.move_forward(SPEED*1.5)
 
                     continue
 
-                if cx < width * 0.4:
-                    motor.set_speed(SPEED, -SPEED)
-                elif cx > width * 0.6:
-                    motor.set_speed(-SPEED, SPEED)
-                else:
-                    motor.move_forward(SPEED)
-                continue
+            servo.value = angle_to_servo_value(90)
+            time.sleep(0.02)
+            distance = measure_distance()
 
-        # ===== 2. ЕСЛИ КВАДРАТА НЕТ → ЕДЕМ ПО СЕНСОРУ =====
-        servo.value = angle_to_servo_value(90)
-        time.sleep(0.02)
-        distance = measure_distance()
-        print("NO TARGET → SENSOR DIST:", distance)
+            if distance < OBSTACLE_LIMIT:
+                motor.stop()
+                choose_best_direction(motor)
+            else:
+                motor.move_forward(SPEED)
 
-        if distance < OBSTACLE_LIMIT:
-            print("OBSTACLE (NO TARGET) → SERVO SCAN")
-            motor.stop()
-            choose_best_direction(motor)
-        else:
-            motor.move_forward(SPEED)
+    except KeyboardInterrupt:
+        print("🛑 STOPPED BY USER")
 
-        if cv2.waitKey(1) == ord('q'):
-            break
+    finally:
+        motor.cleanup()
+        if RECORD_OVERLAY_VIDEO:
+            overlay_writer.release()
+        if RECORD_RAW_VIDEO:
+            raw_writer.release()
+        cv2.destroyAllWindows()
+        print("✅ ALL FILES SAVED AND CLOSED")
 
-    motor.cleanup()
-    cv2.destroyAllWindows()
-
-
+# =====================================================
 if __name__ == "__main__":
     main()

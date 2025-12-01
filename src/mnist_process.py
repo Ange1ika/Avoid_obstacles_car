@@ -2,133 +2,158 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
-import time
 
-OUTPUT_DIR = "output"
+# ===================== ПУТЬ К YOLO TFLITE =====================
+MODEL_PATH = "/home/raspberry/Desktop/avoid_obstacles_car/ckp/best_float32.tflite"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+IMG_SIZE = 320
+NUM_CLASSES = 9          # как у тебя: 14 - 5
+CONF_THRES = 0.3
+NMS_IOU_THRES = 0.5
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # ✅ принудительно CPU
 
 # ===================== TFLITE INIT =====================
-MODEL_PATH = "/home/raspberry/Desktop/avoid_obstacles_car/ckp/mnist.tflite"
-IMG_SIZE = 28
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+print("✅ YOLO TFLite загружена")
+print("Input:", input_details)
+print("Output:", output_details)
 
-# Preprocess with inversion
-# =============================
-def preprocess_digit_inside_blue_roi(img, base_name):
+# ===================== УТИЛИТЫ =====================
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def compute_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter_w = max(0, x2 - x1)
+    inter_h = max(0, y2 - y1)
+    inter_area = inter_w * inter_h
+
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    union = area1 + area2 - inter_area
+    return inter_area / union if union > 0 else 0
+
+
+def nms(detections, iou_thres=0.5):
+    if len(detections) == 0:
+        return []
+
+    detections = sorted(detections, key=lambda x: x["confidence"], reverse=True)
+    final_dets = []
+
+    while detections:
+        best = detections.pop(0)
+        final_dets.append(best)
+
+        remaining = []
+        for det in detections:
+            if det["class_id"] != best["class_id"]:
+                remaining.append(det)
+                continue
+
+            iou = compute_iou(best["box"], det["box"])
+            if iou < iou_thres:
+                remaining.append(det)
+
+        detections = remaining
+
+    return final_dets
+
+# ===================== PREPROCESS =====================
+def preprocess_for_yolo(img):
     """
-    ЭТА ВЕРСИЯ — ТОЧНО ПО ТВОЕМУ ЗАПРОСУ:
-    1) Находим ROI по синей маске
-    2) Внутри ROI ищем цифру
-    3) Строим маску цифры
-    4) Инвертируем маску цифры (НЕ grayscale!)
-    5) Вырезаем цифру
-    6) Resize 28×28
+    Полный кадр:
+    BGR -> RGB -> resize 320×320 -> float32 -> [0..1]
     """
-
-    # ==============================
-    # 1. BLUE MASK → ROI
-    # ==============================
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    lower_blue = np.array([90, 80, 50])
-    upper_blue = np.array([130, 255, 255])
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    #cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_mask_blue.png"), mask_blue)
-
-    if cv2.countNonZero(mask_blue) < 30:
-        return None
-
-    # bounding box по синей области
-    x, y, w, h = cv2.boundingRect(mask_blue)
-    roi = img[y:y+h, x:x+w]
-
-    #cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_roi_blue.png"), roi)
-
-    # ==============================
-    # 2. grayscale внутри ROI
-    # ==============================
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # ==============================
-    # 3. маска цифры
-    # ==============================
-    # используем бинаризацию для отделения чёрной цифры от белого фона
-    _, digit_mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-
-    #cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_digit_mask_raw.png"), digit_mask)
-
-    # ==============================
-    # 4. ИНВЕРСИЯ МАСКИ ЦИФРЫ
-    # ==============================
-    digit_mask_inv = cv2.bitwise_not(digit_mask)
-
-    #cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_digit_mask_inverted.png"), digit_mask_inv)
-
-    digit_resized = cv2.resize(digit_mask_inv, (IMG_SIZE, IMG_SIZE))
-
-    #cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_digit_28x28.png"), digit_resized)
-
-    # ==============================
-    # 7. Normalization
-    # ==============================
-    normalized = digit_resized.astype(np.float32) / 255.0
-
-    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base_name}_norm_28x28.png"), digit_resized)
-
-    # модель принимает (1, 28, 28)
-    tensor = normalized.reshape(1, IMG_SIZE, IMG_SIZE)
-
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    tensor = resized.astype(np.float32) / 255.0
+    tensor = np.expand_dims(tensor, axis=0)  # (1,320,320,3)
     return tensor
 
+# ===================== ОСНОВНОЙ INFER =====================
+def infer_digit_yolo(img):
+    """
+    Возвращает:
+        best_class (int | None)
+        best_conf  (float)
+    """
 
+    h0, w0 = img.shape[:2]
 
-# ------------------------------
-# Inference
-# ------------------------------
-def infer_digit(tensor):
+    tensor = preprocess_for_yolo(img)
+
     interpreter.set_tensor(input_details[0]["index"], tensor)
     interpreter.invoke()
-    logits = interpreter.get_tensor(output_details[0]["index"])
-    probs = tf.nn.softmax(logits)[0].numpy()
 
-    digit = int(np.argmax(probs))
-    conf = float(np.max(probs))
+    output = interpreter.get_tensor(output_details[0]["index"])[0]
+    output = np.transpose(output)   # ✅ [N, 14]
 
-    return digit, conf
+    detections = []
 
+    for det in output:
+        x, y, w, h = det[:4]
+        obj_raw = det[4]
+        class_raw = det[5:5 + NUM_CLASSES]
 
-def recognize_digit_3_frames(camera):
-    results = []
+        obj_conf = sigmoid(obj_raw)
+        class_scores = sigmoid(class_raw)
 
-    for i in range(3):
-        frame = camera.capture_array()
+        cls_id = int(np.argmax(class_scores)) + 1      # ✅ ВАЖНО
+        cls_conf = class_scores[cls_id - 1]
+        conf = obj_conf * cls_conf
 
-        tensor = preprocess_digit_inside_blue_roi(frame, f"live_{i}")
-        if tensor is None:
-            print("⚠️ Digit not extracted")
+        if conf < CONF_THRES:
             continue
 
-        digit, conf = infer_digit(tensor)
-        print(f"Frame {i}: digit={digit}, conf={conf:.2f}")
+        x1 = int((x - w / 2) * w0)
+        y1 = int((y - h / 2) * h0)
+        x2 = int((x + w / 2) * w0)
+        y2 = int((y + h / 2) * h0)
 
-        if conf > 0.5:
-            results.append(digit)
+        detections.append({
+            "class_id": int(cls_id),
+            "confidence": float(conf),
+            "box": [x1, y1, x2, y2]
+        })
 
-        time.sleep(0.1)
+    # ✅ NMS
+    detections = nms(detections, iou_thres=NMS_IOU_THRES)
 
-    if not results:
-        print("❌ No valid digit recognized")
-        return None
+    if len(detections) == 0:
+        return None, 0.0, []
 
-    final_digit = Counter(results).most_common(1)[0][0]
-    print("✅ FINAL DIGIT:", final_digit)
-    return final_digit
+    # ✅ лучший объект
+    best = max(detections, key=lambda x: x["confidence"])
+    return best["class_id"], best["confidence"], detections
+
+# ===================== ОТРИСОВКА =====================
+def draw_detections(img, detections):
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        cls_id = det["class_id"]
+        conf = det["confidence"]
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            img,
+            f"{cls_id} {conf:.2f}",
+            (x1, max(y1 - 5, 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    return img
