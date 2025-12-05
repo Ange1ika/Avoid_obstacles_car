@@ -17,5 +17,8 @@ Sector-based decision: LEFT / CENTER / RIGHT
 
 Motor control for forward motion and turning.
 
-🎞️ Demo
-![demo](assets/car.gif)
+<h2 align="center">🎞️ Demo</h2>
+
+<p align="center">
+  <img src="videos_raw/car.gif">
+</p>
